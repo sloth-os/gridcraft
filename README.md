@@ -14,9 +14,11 @@ Every Monday at 03:17 UTC (and on demand via *Run workflow*), [`.github/workflow
 1. Checks out the latest `main` of `storytold/gridcraft` (an optional `gridcraft-ref` input
    pins a different ref for test runs) and records its version and commit SHA.
 2. Builds `apps/gridcraft-web` with [trunk](https://trunkrs.dev/) **0.22.1 (pinned)** —
-   `--release`, wasm-opt, all asset URLs relative so the site works under the `/gridcraft/`
-   project-pages prefix. `wasm-bindgen-cli` is installed at the exact version upstream's
-   `Cargo.lock` pins.
+   `--release --locked`, wasm-opt, all asset URLs relative so the site works under the
+   `/gridcraft/` project-pages prefix. `--locked` makes cargo honor upstream's committed
+   `Cargo.lock` exactly (a lock needing updates fails the build instead of silently
+   shipping different dependencies); `wasm-bindgen-cli` is installed at the exact version
+   that lock pins.
 3. Wraps the trunk output into a PWA:
    - `manifest.webmanifest` — app name, stable `id`, theme colour, 192px + 512px +
      maskable icons (`pwa/manifest.webmanifest`), version stamped into the description.

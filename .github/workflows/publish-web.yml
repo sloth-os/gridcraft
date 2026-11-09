@@ -96,7 +96,9 @@ jobs:
 
       - name: Build WASM app with trunk
         working-directory: gridcraft/apps/gridcraft-web
-        run: trunk build --release --dist "$GITHUB_WORKSPACE/site" --public-url ./
+        # --locked: cargo must honor upstream's committed Cargo.lock exactly; a lock that
+        # needs updating fails the build instead of silently shipping different deps.
+        run: trunk build --release --locked --dist "$GITHUB_WORKSPACE/site" --public-url ./
 
       - name: Upload raw dist artifact (for debugging)
         if: failure()
