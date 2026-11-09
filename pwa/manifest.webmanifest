@@ -1,0 +1,26 @@
+{
+  "name": "GridCraft",
+  "short_name": "GridCraft",
+  "description": "GridCraft — spreadsheets and data. A fast, open-source spreadsheet app that runs entirely in your browser and works offline.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f3f3f3",
+  "theme_color": "#1f9d55",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "icons/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512-maskable.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,200 @@
+name: Publish web (GitHub Pages)
+
+# Builds the GridCraft WASM app from upstream storytold/gridcraft and publishes it to
+# GitHub Pages, as an installable PWA that works offline. Runs weekly (and on demand).
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC — off the hour to ease the peak on github.com
+  workflow_dispatch:
+    inputs:
+      gridcraft-ref:
+        description: "Upstream gridcraft ref to build (default: main)"
+        type: string
+        default: ""
+
+# Read the upstream source; publish with the built-in Pages deployment (GITHUB_TOKEN).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer run waits rather than cancelling a mid-deploy publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "--cfg bindgen_0_71_plus"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gridcraft-web (this repo — PWA shell and workflow)
+        uses: actions/checkout@v4
+
+      - name: Checkout gridcraft (upstream app source)
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/gridcraft
+          # Default: main. The scheduled run rebuilds the latest upstream every week.
+          ref: ${{ inputs.gridcraft-ref || 'main' }}
+          path: gridcraft
+
+      - name: Install Rust with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install trunk
+        uses: jetli/trunk-install-action@v0.6.0
+        with:
+          version: latest
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          # Match wasm-bindgen-cli to the wasm-bindgen crate version the app locks in
+          # Cargo.lock (a mismatch makes trunk's wasm-bindgen step fail).
+          version="$(awk '
+            $0 == "[[package]]" { if (name == "wasm-bindgen" && src ~ /crates[.]io/) { print ver; done = 1 } in_pkg = 1; name = ""; ver = ""; src = ""; next }
+            in_pkg && $1 == "name" { gsub(/[" ]/, "", $3); name = $3 }
+            in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); ver = $3 }
+            in_pkg && $1 == "source" { gsub(/[" ]/, "", $3); src = $3 }
+            END { if (!done && name == "wasm-bindgen" && src ~ /crates[.]io/) print ver }
+          ' gridcraft/Cargo.lock)"
+          [[ -n "$version" ]] || { echo "error: wasm-bindgen not found in gridcraft/Cargo.lock" >&2; exit 1; }
+          echo "wasm-bindgen crate version: $version"
+          cargo install wasm-bindgen-cli --locked --version "$version"
+          wasm-bindgen --version
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Read upstream version
+        id: version
+        run: echo "version=$(awk '/^\[/ { in_pkg = ($0 == "[workspace.package]"); next } in_pkg && $1 == "version" { gsub(/[\" ]/, "", $3); print $3; exit }' gridcraft/Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Build WASM app with trunk
+        working-directory: gridcraft/apps/gridcraft-web
+        env:
+          GRIDCRAFT_BUILD_SHA: ${{ github.event_name == 'schedule' && 'weekly' || github.sha }}
+        run: trunk build --release --dist "$GITHUB_WORKSPACE/site" --public-url ./
+
+      - name: Upload raw dist artifact (for debugging)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trunk-dist-on-failure
+          path: site/
+          if-no-files-found: ignore
+
+      - name: Assemble the PWA site
+        env:
+          GRIDCRAFT_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_DATE: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+
+          # 1. Everything trunk produced (index.html + hashed wasm/js assets, relative URLs).
+          # Relative public_url keeps the site working on project pages (…/gridcraft/).
+          mkdir -p publish/icons
+          cp -R site/. publish/
+
+          # 2. PWA: manifest + icons + service worker, then wire them into index.html.
+          cp pwa/manifest.webmanifest publish/
+          cp pwa/icons/*.png publish/icons/
+          cp pwa/sw.js publish/
+
+          # Compute SHA-256 integrity hashes for the two hashed app assets. The service worker
+          # precaches them, so it must name the exact files trunk emitted (it can't glob).
+          js_file="$(ls publish/gridcraft-web-*.js)"
+          wasm_file="$(ls publish/gridcraft-web-*_bg.wasm)"
+          js_hash="$(sha256sum "$js_file" | cut -d' ' -f1)"
+          wasm_hash="$(sha256sum "$wasm_file" | cut -d' ' -f1)"
+          echo "app asset: $(basename "$js_file") / $(basename "$wasm_file")"
+
+          # Compute the service worker's own content hash for the cache-busting update dance.
+          sw_hash="$(sha256sum publish/sw.js | cut -d' ' -f1 | cut -c1-12)"
+
+          # 3. Fill in the manifest placeholders (version, date, upstream ref).
+          sed -i \
+            -e "s|@GRIDCRAFT_VERSION@|$GRIDCRAFT_VERSION|g" \
+            -e "s|@BUILD_DATE@|${BUILD_DATE%%T*}|g" \
+            publish/manifest.webmanifest
+
+          # 4. Register the manifest + service worker in the trunk-built page and drop in
+          #    the offline fallback page. Everything else in index.html stays upstream's.
+          python3 - <<'PY'
+          import json, pathlib
+
+          publish = pathlib.Path("publish")
+          html = (publish / "index.html").read_text()
+
+          # The app's title/description carry into the PWA manifest.
+          html = html.replace(
+              "</head>",
+              '  <link rel="manifest" href="manifest.webmanifest">\n'
+              '  <meta name="description" content="GridCraft — spreadsheets and data, in your browser or installed as an offline PWA.">\n'
+              "</head>",
+          )
+          html = html.replace(
+              "<body>",
+              "<body>\n"
+              '  <script>\n'
+              "    // PWA: register the service worker for offline use.\n"
+              "    // sw.js precaches index.html, the hashed wasm/js bundle and the icons;\n"
+              "    // a byte-different sw.js is how the browser finds out a new build exists.\n"
+              "    if ('serviceWorker' in navigator) {\n"
+              "      window.addEventListener('load', () => {\n"
+              "        navigator.serviceWorker.register('sw.js', { scope: './' }).catch(() => {});\n"
+              "      });\n"
+              "    }\n"
+              "  </script>",
+          )
+          (publish / "index.html").write_text(html)
+          PY
+          cp pwa/offline.html publish/
+
+          # 5. Emit the final service worker with the real asset names, hashes and build stamp.
+          sed -i \
+            -e "s|@JS_FILE@|${js_file#publish/}|g" \
+            -e "s|@JS_SHA256@|$js_hash|g" \
+            -e "s|@WASM_FILE@|${wasm_file#publish/}|g" \
+            -e "s|@WASM_SHA256@|$wasm_hash|g" \
+            -e "s|@BUILD_STAMP@|${GRIDCRAFT_VERSION}+${BUILD_DATE%%T*} ($sw_hash)|g" \
+            publish/sw.js
+
+          ls -la publish/
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: publish/
+
+      - name: Summary
+        run: |
+          {
+            echo "### GridCraft web build → GitHub Pages"
+            echo
+            echo "- Upstream: \`${{ inputs.gridcraft-ref || 'storytold/gridcraft@main' }}\` (v${{ steps.version.outputs.version }})"
+            echo "- Build date: ${{ github.run_started_at }}"
+            echo "- Deploying to: \`${{ steps.pages.outputs.base_url }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    outputs:
+      base_url: ${{ steps.pages.outputs.base_url }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ needs.build.outputs.base_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
