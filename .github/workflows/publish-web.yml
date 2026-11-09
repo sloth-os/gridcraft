@@ -2,6 +2,11 @@ name: Publish web (GitHub Pages)
 
 # Builds the GridCraft WASM app from upstream storytold/gridcraft and publishes it to
 # GitHub Pages, as an installable PWA that works offline. Runs weekly (and on demand).
+#
+# After a successful deploy, the `record` job commits build-info.json back to this repo.
+# Besides build provenance, that weekly push is what keeps the schedule alive: GitHub
+# auto-disables scheduled workflows in public repos after 60 days without repository
+# activity, and this repo would otherwise never see a push.
 on:
   schedule:
     - cron: "17 3 * * 1" # Mondays 03:17 UTC — off the hour to ease the peak on github.com
@@ -12,11 +17,8 @@ on:
         type: string
         default: ""
 
-# Read the upstream source; publish with the built-in Pages deployment (GITHUB_TOKEN).
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deployment at a time; a newer run waits rather than cancelling a mid-deploy publish.
 concurrency:
@@ -49,8 +51,11 @@ jobs:
 
       - name: Install trunk
         run: |
-          # Install from crates.io (the jetli/trunk-install-action repo is gone).
-          cargo install trunk --locked
+          # Pinned: trunk authors the deployed index.html/asset pipeline, so an unpinned
+          # `cargo install trunk` would let the published site change week to week without
+          # any commit here. --locked pins trunk's own dependency tree; the version pin
+          # pins trunk itself. Bump deliberately, after a test run.
+          cargo install trunk --locked --version 0.22.1
           trunk --version
 
       - name: Install wasm-bindgen-cli
@@ -72,14 +77,25 @@ jobs:
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - name: Read upstream version
-        id: version
-        run: echo "version=$(awk '/^\[/ { in_pkg = ($0 == "[workspace.package]"); next } in_pkg && $1 == "version" { gsub(/[\" ]/, "", $3); print $3; exit }' gridcraft/Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - name: Build timestamp
+        id: stamp
+        # github.run_started_at does not exist in the github context (it renders as an
+        # empty string); take the timestamp from the runner's clock instead.
+        run: echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Read upstream version and commit
+        id: upstream
+        run: |
+          set -euo pipefail
+          version="$(awk '/^\[/ { in_pkg = ($0 == "[workspace.package]"); next } in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }' gridcraft/Cargo.toml)"
+          [[ -n "$version" ]] || { echo "error: could not read version from gridcraft/Cargo.toml" >&2; exit 1; }
+          sha="$(git -C gridcraft rev-parse --short HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "upstream: v$version ($sha)"
 
       - name: Build WASM app with trunk
         working-directory: gridcraft/apps/gridcraft-web
-        env:
-          GRIDCRAFT_BUILD_SHA: ${{ github.event_name == 'schedule' && 'weekly' || github.sha }}
         run: trunk build --release --dist "$GITHUB_WORKSPACE/site" --public-url ./
 
       - name: Upload raw dist artifact (for debugging)
@@ -92,47 +108,67 @@ jobs:
 
       - name: Assemble the PWA site
         env:
-          GRIDCRAFT_VERSION: ${{ steps.version.outputs.version }}
-          BUILD_DATE: ${{ github.run_started_at }}
+          GRIDCRAFT_VERSION: ${{ steps.upstream.outputs.version }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          BUILD_TS: ${{ steps.stamp.outputs.ts }}
         run: |
           set -euo pipefail
 
-          # 1. Everything trunk produced (index.html + hashed wasm/js assets, relative URLs).
+          # 1. Everything trunk produced (index.html + hashed assets, relative URLs).
           # Relative public_url keeps the site working on project pages (…/gridcraft/).
           mkdir -p publish/icons
           cp -R site/. publish/
+          # trunk's zero-byte build lockfile is build metadata, not part of the site.
+          rm -f publish/.trunk-lock
 
-          # 2. PWA: manifest + icons + service worker, then wire them into index.html.
+          # 2. Discover the hashed app bundle in trunk's output. Exactly one of each;
+          #    a glob that silently matches zero or two files is a build error, not luck.
+          js_file="$(find site -maxdepth 1 -name 'gridcraft-web-*.js' | sort)"
+          wasm_file="$(find site -maxdepth 1 -name 'gridcraft-web-*_bg.wasm' | sort)"
+          [[ "$(printf '%s\n' "$js_file" | grep -c .)" -eq 1 ]] || { echo "error: expected exactly one gridcraft-web-*.js, got: ${js_file:-<none>}" >&2; exit 1; }
+          [[ "$(printf '%s\n' "$wasm_file" | grep -c .)" -eq 1 ]] || { echo "error: expected exactly one gridcraft-web-*_bg.wasm, got: ${wasm_file:-<none>}" >&2; exit 1; }
+          js_name="${js_file#site/}"
+          wasm_name="${wasm_file#site/}"
+
+          # 3. Subresource-integrity hashes for the service worker's precache fetches.
+          # SRI digests are base64 — sha256sum's hex output is NOT a valid SRI value and
+          # makes every integrity-checked fetch (and thus the SW install) fail.
+          js_hash="$(openssl dgst -sha256 -binary "$js_file" | openssl base64 -A)"
+          wasm_hash="$(openssl dgst -sha256 -binary "$wasm_file" | openssl base64 -A)"
+          echo "app asset: $js_name / $wasm_name"
+
+          # 4. Every OTHER file trunk emitted (hashed favicon, the eframe snippet modules
+          # the bundle statically imports, any future asset) must be precached too —
+          # without the snippets the offline app's module graph never instantiates.
+          extras="$(cd site && find . -type f \
+              ! -name index.html ! -name '.trunk-lock' \
+              ! -name 'gridcraft-web-*.js' ! -name 'gridcraft-web-*_bg.wasm' \
+            | sort | sed "s|^\./|'./|; s|$|',|" | tr -d '\n')"
+          echo "extra precache files: ${extras:-<none>}"
+
+          # 5. PWA: manifest + icons + service worker template.
           cp pwa/manifest.webmanifest publish/
           cp pwa/icons/*.png publish/icons/
           cp pwa/sw.js publish/
 
-          # Compute SHA-256 integrity hashes for the two hashed app assets. The service worker
-          # precaches them, so it must name the exact files trunk emitted (it can't glob).
-          js_file="$(ls publish/gridcraft-web-*.js)"
-          wasm_file="$(ls publish/gridcraft-web-*_bg.wasm)"
-          js_hash="$(sha256sum "$js_file" | cut -d' ' -f1)"
-          wasm_hash="$(sha256sum "$wasm_file" | cut -d' ' -f1)"
-          echo "app asset: $(basename "$js_file") / $(basename "$wasm_file")"
+          # 6. Fill in the manifest placeholder (the version in its description).
+          sed -i -e "s|@GRIDCRAFT_VERSION@|$GRIDCRAFT_VERSION|g" publish/manifest.webmanifest
 
-          # Compute the service worker's own content hash for the cache-busting update dance.
-          sw_hash="$(sha256sum publish/sw.js | cut -d' ' -f1 | cut -c1-12)"
-
-          # 3. Fill in the manifest placeholders (version, date, upstream ref).
-          sed -i \
-            -e "s|@GRIDCRAFT_VERSION@|$GRIDCRAFT_VERSION|g" \
-            -e "s|@BUILD_DATE@|${BUILD_DATE%%T*}|g" \
-            publish/manifest.webmanifest
-
-          # 4. Register the manifest + service worker in the trunk-built page and drop in
+          # 7. Register the manifest + service worker in the trunk-built page and drop in
           #    the offline fallback page. Everything else in index.html stays upstream's.
           python3 - <<'PY'
-          import json, pathlib
+          import pathlib
+          import sys
 
-          publish = pathlib.Path("publish")
-          html = (publish / "index.html").read_text()
+          path = pathlib.Path("publish") / "index.html"
+          html = path.read_text()
 
-          # The app's title/description carry into the PWA manifest.
+          # Fail loudly if upstream ever changes these markers: a string .replace() that
+          # misses is a silent no-op, and the PWA wiring would quietly disappear.
+          for marker in ("</head>", "<body>"):
+              if html.count(marker) != 1:
+                  sys.exit(f"error: expected exactly one {marker!r} in trunk's index.html, found {html.count(marker)}")
+
           html = html.replace(
               "</head>",
               '  <link rel="manifest" href="manifest.webmanifest">\n'
@@ -144,8 +180,8 @@ jobs:
               "<body>\n"
               '  <script>\n'
               "    // PWA: register the service worker for offline use.\n"
-              "    // sw.js precaches index.html, the hashed wasm/js bundle and the icons;\n"
-              "    // a byte-different sw.js is how the browser finds out a new build exists.\n"
+              "    // sw.js precaches the app shell, the hashed wasm/js bundle, eframe's\n"
+              "    // snippet modules, the favicon and the icons.\n"
               "    if ('serviceWorker' in navigator) {\n"
               "      window.addEventListener('load', () => {\n"
               "        navigator.serviceWorker.register('sw.js', { scope: './' }).catch(() => {});\n"
@@ -153,20 +189,39 @@ jobs:
               "    }\n"
               "  </script>",
           )
-          (publish / "index.html").write_text(html)
+          path.write_text(html)
+          print("index.html: manifest link + service worker registration injected")
           PY
           cp pwa/offline.html publish/
 
-          # 5. Emit the final service worker with the real asset names, hashes and build stamp.
+          # 8. Emit the final service worker: real asset names, base64 integrity hashes,
+          # the full extra-precache list and the build stamp (version + timestamp + upstream
+          # commit). The timestamp makes sw.js byte-different on every publish, which is how
+          # browsers detect the new build; no self-hash chicken-and-egg needed.
           sed -i \
-            -e "s|@JS_FILE@|${js_file#publish/}|g" \
+            -e "s|@JS_FILE@|$js_name|g" \
             -e "s|@JS_SHA256@|$js_hash|g" \
-            -e "s|@WASM_FILE@|${wasm_file#publish/}|g" \
+            -e "s|@WASM_FILE@|$wasm_name|g" \
             -e "s|@WASM_SHA256@|$wasm_hash|g" \
-            -e "s|@BUILD_STAMP@|${GRIDCRAFT_VERSION}+${BUILD_DATE%%T*} ($sw_hash)|g" \
+            -e "s|@EXTRA_PRECACHE@|$extras|g" \
+            -e "s|@BUILD_STAMP@|${GRIDCRAFT_VERSION}+${BUILD_TS} (${UPSTREAM_SHA})|g" \
+            -e "s|@BUILD_TS@|$BUILD_TS|g" \
             publish/sw.js
 
+          # 9. No placeholder may survive into the published site.
+          if grep -rlE '@[A-Z_]+@' publish --include='*.js' --include='*.html' --include='*.webmanifest'; then
+            echo "error: unsubstituted @PLACEHOLDER@ remains in the files listed above" >&2
+            exit 1
+          fi
+
+          {
+            echo "js_name=$js_name"
+            echo "wasm_name=$wasm_name"
+          } >> "$GITHUB_OUTPUT"
+
           ls -la publish/
+        # Step-level outputs feed the job outputs used by the verify/record jobs.
+        id: assemble
 
       - name: Configure Pages
         id: pages
@@ -182,20 +237,117 @@ jobs:
           {
             echo "### GridCraft web build → GitHub Pages"
             echo
-            echo "- Upstream: \`${{ inputs.gridcraft-ref || 'storytold/gridcraft@main' }}\` (v${{ steps.version.outputs.version }})"
-            echo "- Build date: ${{ github.run_started_at }}"
+            echo "- Upstream: \`${{ inputs.gridcraft-ref || 'storytold/gridcraft@main' }}\` (v${{ steps.upstream.outputs.version }}, commit \`${{ steps.upstream.outputs.sha }}\`)"
+            echo "- Build timestamp: ${{ steps.stamp.outputs.ts }}"
             echo "- Deploying to: \`${{ steps.pages.outputs.base_url }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
     outputs:
       base_url: ${{ steps.pages.outputs.base_url }}
+      version: ${{ steps.upstream.outputs.version }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      build_ts: ${{ steps.stamp.outputs.ts }}
+      js_name: ${{ steps.assemble.outputs.js_name }}
+      wasm_name: ${{ steps.assemble.outputs.wasm_name }}
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Only the deploying job needs the Pages write + OIDC tokens; the build job (which
+    # compiles unreviewed upstream code) must not be able to mint them.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ needs.build.outputs.base_url }}
     steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
+
+  verify:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke-test the deployed site
+        env:
+          BASE: ${{ needs.build.outputs.base_url }}
+          EXPECTED_STAMP: ${{ needs.build.outputs.version }}+${{ needs.build.outputs.build_ts }} (${{ needs.build.outputs.sha }})
+          JS_NAME: ${{ needs.build.outputs.js_name }}
+          WASM_NAME: ${{ needs.build.outputs.wasm_name }}
+          CB: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          fetch() { curl -sfL --retry 6 --retry-delay 10 --retry-all-errors "$@"; }
+
+          fetch "${BASE}index.html?cb=${CB}" -o live-index.html
+          fetch "${BASE}sw.js?cb=${CB}" -o live-sw.js
+          fetch "${BASE}manifest.webmanifest?cb=${CB}" -o live-manifest.json
+
+          echo "== index.html: PWA wiring present =="
+          grep -q 'rel="manifest"' live-index.html
+          grep -q 'serviceWorker.register' live-index.html
+          grep -q 'name="description"' live-index.html
+
+          echo "== sw.js: stamped, SRI is base64, assets named =="
+          grep -qF "const VERSION = 'gridcraft-${EXPECTED_STAMP}" live-sw.js
+          grep -qE "sha256-[A-Za-z0-9+/]{43}=" live-sw.js
+          ! grep -qE "sha256-[0-9a-f]{64}" live-sw.js
+          grep -qF "./${JS_NAME}" live-sw.js
+          grep -qF "./${WASM_NAME}" live-sw.js
+
+          echo "== manifest: valid JSON, filled in =="
+          python3 -m json.tool live-manifest.json > /dev/null
+          grep -q '"id"' live-manifest.json
+          grep -q 'icons/icon-192.png' live-manifest.json
+          grep -qF "${EXPECTED_STAMP%%+*}" live-manifest.json
+
+          echo "== no placeholder survived anywhere =="
+          ! grep -lE '@[A-Z_]+@' live-index.html live-sw.js live-manifest.json
+
+          echo "== every file the service worker precaches actually serves =="
+          grep -oE "'\./[^']+'" live-sw.js | tr -d "'" | sed 's|^\./||' | sort -u | while read -r p; do
+            case "$p" in ''|'index.html') continue ;; esac
+            echo "  HEAD ${BASE}${p}"
+            fetch -o /dev/null -I "${BASE}${p}"
+          done
+
+          echo "SMOKE TEST PASSED: ${BASE}"
+
+  record:
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout gridcraft-web
+        uses: actions/checkout@v4
+
+      - name: Commit build-info.json (provenance + cron keepalive)
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+          BUILD_TS: ${{ needs.build.outputs.build_ts }}
+          SITE: ${{ needs.build.outputs.base_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cat > build-info.json <<EOF
+          {
+            "version": "$VERSION",
+            "upstream_sha": "$UPSTREAM_SHA",
+            "build_ts": "$BUILD_TS",
+            "site": "$SITE",
+            "run": "$RUN_URL"
+          }
+          EOF
+          cat build-info.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build-info.json
+          if git diff --cached --quiet; then
+            echo "build-info.json unchanged; nothing to commit"
+          else
+            git commit -m "Record build $BUILD_TS: GridCraft $VERSION ($UPSTREAM_SHA)"
+            git push
+          fi
