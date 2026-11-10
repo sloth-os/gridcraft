@@ -280,6 +280,9 @@ jobs:
           CB: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          # configure-pages emits base_url WITHOUT a trailing slash; normalize before
+          # concatenating paths onto it.
+          BASE="${BASE%/}/"
           fetch() { curl -sfL --retry 6 --retry-delay 10 --retry-all-errors "$@"; }
 
           fetch "${BASE}index.html?cb=${CB}" -o live-index.html
@@ -334,6 +337,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          SITE="${SITE%/}/"   # configure-pages base_url has no trailing slash
           cat > build-info.json <<EOF
           {
             "version": "$VERSION",
