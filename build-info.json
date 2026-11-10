@@ -1,0 +1,7 @@
+{
+  "version": "0.16.0",
+  "upstream_sha": "e9addf5",
+  "build_ts": "2026-11-10T00:20:21Z",
+  "site": "https://sloth-os.github.io/gridcraft/",
+  "run": "https://github.com/sloth-os/gridcraft/actions/runs/42726357826"
+}
