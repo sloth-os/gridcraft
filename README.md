@@ -35,8 +35,9 @@ Every Monday at 03:17 UTC (and on demand via *Run workflow*), [`.github/workflow
 5. Commits [`build-info.json`](build-info.json) back to this repo (see *Provenance and
    keepalive* below).
 
-This repository contains **no gridcraft source code** — only the publishing workflow and the
-PWA shell in `pwa/`. Everything else is built fresh from upstream every week.
+This repository contains **no gridcraft source code** — only the publishing workflow, the
+PWA shell in `pwa/`, and the local test harness in `tests/`. Everything else is built fresh
+from upstream every week.
 
 ## Offline behaviour and the update cycle
 
@@ -83,6 +84,15 @@ re-enable it under *Actions → Publish web (GitHub Pages) → … menu → Enab
 
 *Actions → Publish web (GitHub Pages) → Run workflow.* Optionally set `gridcraft-ref`
 (e.g. a tag or a PR head SHA) to build something other than `main`.
+
+## Tests
+
+`bash tests/run-local.sh` — offline regression test for the PWA shell. It extracts the
+workflow's *real* assemble and verify scripts from the YAML (so tests can't drift from CI),
+runs them against a fake trunk output, then exercises the generated `sw.js` in a
+ServiceWorker mock (install precache set, activate cache rotation, network-first
+navigations, cache-first assets, scope filtering). Needs `python3` (+PyYAML), `node`,
+`openssl`, `curl`; no network access.
 
 ## Licence
 
