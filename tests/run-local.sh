@@ -43,7 +43,8 @@ cat > "$WORK/site/index.html" <<'HTML'
     <link rel="modulepreload" href="./snippets/eframe-test/inline0.js" crossorigin="anonymous" integrity="sha384-ccc"/>
   </head>
   <body>
-    <div id="gridcraft_loading">Loading GridCraft…</div>
+    <canvas id="gridcraft_canvas"></canvas>
+    <div id="gridcraft_loading">Loading GridCraft&hellip;</div>
     <script type="module">import init from './gridcraft-web-c40cb0ab7da8bf2c.js'; init();</script>
   </body>
 </html>
@@ -67,6 +68,9 @@ echo "  assemble OK (outputs set, .trunk-lock dropped)"
 
 echo "== service worker semantics (tests/sw-test.js) =="
 node "$ROOT/tests/sw-test.js" "$WORK/publish/sw.js"
+
+echo "== file-handling consumer (tests/launch-test.js) =="
+node "$ROOT/tests/launch-test.js" "$ROOT/pwa/launch.js"
 
 echo "== deploy smoke test (workflow's real verify script, over local HTTP) =="
 PORT=$((20000 + RANDOM % 20000))

@@ -10,6 +10,23 @@
   "background_color": "#f3f3f3",
   "theme_color": "#1f9d55",
   "categories": ["productivity", "utilities"],
+  "launch_handler": {
+    "client_mode": ["focus-existing", "auto"]
+  },
+  "file_handlers": [
+    {
+      "action": "./",
+      "accept": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+        "application/vnd.ms-excel.sheet.macroEnabled.12": [".xlsm"],
+        "application/vnd.ms-excel.sheet.binary.macroEnabled.12": [".xlsb"],
+        "application/vnd.oasis.opendocument.spreadsheet": [".ods"],
+        "text/csv": [".csv"],
+        "text/tab-separated-values": [".tsv"]
+      },
+      "launch_type": "single-client"
+    }
+  ],
   "icons": [
     {
       "src": "icons/icon-192.png",

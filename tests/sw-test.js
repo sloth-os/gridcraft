@@ -1,9 +1,12 @@
 /* Exercise the generated service worker (publish/sw.js) against a faithful mock of the
  * ServiceWorker globals: CacheStorage, fetch, clients, registration. Verifies:
- *   1. install: precaches app shell + icons + extras (snippets/ico) + SRI-checked bundle;
- *      skipWaiting deliberately NOT called
+ *   1. install: precaches app shell + icons + launch.js + extras (snippets/ico) + SRI-checked
+ *      bundle; skipWaiting deliberately NOT called
  *   2. activate: keeps current + previous gridcraft-cache-* (sortable names), deletes older
  *      and legacy-format caches; clients.claim deliberately NOT called
+ *   2b. cache-first prefers the CURRENT cache over the retained previous one for stable
+ *      names (manifest/launch.js change content between builds); the cross-cache fallback
+ *      still resolves old hashed assets that only the previous cache holds
  *   3. fetch navigate: network-first bypassing HTTP cache; caches ONLY ok+basic responses
  *      for the shell URL under './index.html'; non-shell and non-OK navigations never
  *      overwrite it; offline falls back to cached shell
@@ -17,6 +20,11 @@ const fs = require('fs');
 const vm = require('vm');
 const assert = require('assert');
 
+const watchdog = setTimeout(() => {
+  console.error('FAIL: sw-test.js hung — a service worker promise never resolved (20s real-time watchdog)');
+  process.exit(1);
+}, 20000);
+
 const swPath = process.argv[2];
 const code = fs.readFileSync(swPath, 'utf8');
 
@@ -27,11 +35,20 @@ const CACHE = /const CACHE = '([^']+)'/.exec(code)[1];
 const JS = /const JS = '\.\/([^']+)'/.exec(code)[1];
 const WASM = /const WASM = '\.\/([^']+)'/.exec(code)[1];
 const EXTRA = [.../const PRECACHE_EXTRA = \[([^\]]*)\]/.exec(code)[1].matchAll(/'\.\/([^']+)'/g)].map((m) => m[1]);
+const SHELL = [.../const APP_SHELL = \[([\s\S]*?)\];/.exec(code)[1].matchAll(/'(\.\/[^']*)'/g)].map((m) => m[1]);
 const VERSION = /const VERSION = '([^']+)'/.exec(code)[1];
 assert.ok(!/@[A-Z_]+@/.test(code), 'no unsubstituted placeholder in generated sw.js');
 assert.match(VERSION, /^gridcraft-\d+\.\d+\.\d+\+\d{4}-\d{2}-\d{2}T[\d:]+Z \([0-9a-f]+\)$/, 'VERSION stamp shape');
 assert.match(CACHE, /^gridcraft-cache-\d{4}-\d{2}-\d{2}T[\d:]+Z$/, 'sortable CACHE name');
-console.log(`parsed: CACHE=${CACHE} JS=${JS} WASM=${WASM} EXTRA=[${EXTRA}]`);
+// The shell must hold everything an offline (or OS file-launch) cold start needs — including
+// launch.js, the File Handling consumer the injected <script src> tag loads.
+for (const s of [
+  './', './index.html', './offline.html', './manifest.webmanifest', './launch.js',
+  './icons/icon-192.png', './icons/icon-512.png', './icons/icon-512-maskable.png',
+]) {
+  assert(SHELL.includes(s), `APP_SHELL must precache ${s}`);
+}
+console.log(`parsed: CACHE=${CACHE} JS=${JS} WASM=${WASM} SHELL=${SHELL.length} EXTRA=[${EXTRA}]`);
 
 const normalize = (u) => {
   if (typeof u === 'string') return new URL(u, SCOPE).href;
@@ -131,18 +148,14 @@ const reqOf = (url, mode, method) => new FakeRequest(url, { mode, method });
   const names = await caches.keys();
   assert.deepStrictEqual(names, [CACHE], `exactly one cache after install: ${names}`);
   const cache = await caches.open(CACHE);
-  const expected = [
-    './', './index.html', './offline.html', './manifest.webmanifest',
-    './icons/icon-192.png', './icons/icon-512.png', './icons/icon-512-maskable.png',
-    ...EXTRA.map((e) => './' + e), `./${JS}`, `./${WASM}`,
-  ];
+  const expected = [...SHELL, ...EXTRA.map((e) => './' + e), `./${JS}`, `./${WASM}`];
   for (const s of expected) assert(await cache.match(s), `precached: ${s}`);
   assert.strictEqual(cache.map.size, expected.length, `no extra entries (${cache.map.size} vs ${expected.length})`);
   assert.ok(!swSelf.__skipWaiting, 'skipWaiting NOT called (updates wait for tabs to close)');
   // navigate fetches during install used cache:'reload' for the bundle
   const jsFetch = fetched.find((f) => f.url.endsWith(JS));
   assert.strictEqual(jsFetch.cache, 'reload', 'bundle fetched with cache:reload');
-  console.log(`install: ${expected.length} entries precached (shell+icons+${EXTRA.length} extras+bundle), no skipWaiting OK`);
+  console.log(`install: ${expected.length} entries precached (${SHELL.length} shell incl. launch.js + ${EXTRA.length} extras + bundle), no skipWaiting OK`);
 
   // --- 2. activate: keep current + previous only --------------------------------
   await caches.open('gridcraft-cache-2020-01-01T00:00:00Z');   // old
@@ -156,6 +169,42 @@ const reqOf = (url, mode, method) => new FakeRequest(url, { mode, method });
     `kept previous+current, deleted old+legacy, got: ${after}`);
   assert.ok(!swSelf.__claimed, 'clients.claim NOT called');
   console.log('activate: keeps current+previous, drops old+legacy, no claim OK');
+
+  // --- 2b. cache-first must prefer the CURRENT cache over the retained previous one -------
+  // Stable-name shell files (manifest.webmanifest, launch.js) change content between builds.
+  // CacheStorage.match() searches caches in creation order and the previous build's cache was
+  // created FIRST in a real browser — a bare cross-cache match would therefore serve the OLD
+  // copy one build late (this exact shadowing hid a file_handlers-less manifest from
+  // Chromium's silent manifest refresh). The cross-cache fallback must still resolve assets
+  // that only the previous cache holds (a stale index.html during the propagation window).
+  {
+    const PREV = 'gridcraft-cache-2026-11-03T00:00:00Z';
+    const prev = await caches.open(PREV);
+    await prev.put(SCOPE + 'manifest.webmanifest', new FakeResponse('MANIFEST-V1'));
+    await prev.put(SCOPE + 'launch.js', new FakeResponse('LAUNCH-V1'));
+    await prev.put(SCOPE + 'old-hash-only.js', new FakeResponse('OLD-ASSET'));
+    await cache.put(SCOPE + 'manifest.webmanifest', new FakeResponse('MANIFEST-V2'));
+    await cache.put(SCOPE + 'launch.js', new FakeResponse('LAUNCH-V2'));
+    // Faithful creation order: in the browser the previous build's cache was opened first.
+    caches.store.delete(PREV);
+    caches.store.delete(CACHE);
+    caches.store.set(PREV, prev);
+    caches.store.set(CACHE, cache);
+
+    fetched = [];
+    for (const [name, want] of [['manifest.webmanifest', 'MANIFEST-V2'], ['launch.js', 'LAUNCH-V2']]) {
+      const e = makeEvent(reqOf(SCOPE + name, 'no-cors'));
+      await fire('fetch', e);
+      const r = await e.__response;
+      assert.strictEqual(r.body, want, `${name} served from the CURRENT cache, not the previous`);
+    }
+    const eOld = makeEvent(reqOf(SCOPE + 'old-hash-only.js', 'no-cors'));
+    await fire('fetch', eOld);
+    const rOld = await eOld.__response;
+    assert.strictEqual(rOld.body, 'OLD-ASSET', 'previous-cache fallback still resolves old assets');
+    assert.strictEqual(fetched.length, 0, 'no network for any cache hit');
+    console.log('fetch preference: current cache wins for stable names, previous-cache fallback OK');
+  }
 
   // --- 3. fetch: navigation network-first, bypasses HTTP cache -------------------
   fetched = [];
@@ -229,5 +278,6 @@ const reqOf = (url, mode, method) => new FakeRequest(url, { mode, method });
   assert(resp && resp.status === 503, 'uncached asset offline → 503');
   console.log('fetch uncached offline: 503 OK');
 
+  clearTimeout(watchdog);
   console.log('\nALL SERVICE WORKER TESTS PASSED');
-})().catch((err) => { console.error('FAIL:', err.message); process.exit(1); });
+})().catch((err) => { clearTimeout(watchdog); console.error('FAIL:', err.message); process.exit(1); });

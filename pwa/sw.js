@@ -6,9 +6,10 @@
  *
  * Strategy:
  *  - Precache everything the app needs offline on first load: the app shell (index.html,
- *    offline fallback, manifest, icons), the hashed wasm-bindgen JS + wasm bundle (fetched
- *    with SRI), and every other trunk-emitted file — the bundle statically imports the eframe
- *    snippets, so a missing snippet would break the module graph and hang the offline boot.
+ *    offline fallback, manifest, launch.js for OS file launches, icons), the hashed
+ *    wasm-bindgen JS + wasm bundle (fetched with SRI), and every other trunk-emitted file —
+ *    the bundle statically imports the eframe snippets, so a missing snippet would break the
+ *    module graph and hang the offline boot.
  *  - Navigations are network-first (bypassing the HTTP cache, so a stale index.html can never
  *    be re-served after a deploy) with an offline fallback to the cached shell. Only OK
  *    responses for the shell URL itself are stored. All other same-scope GETs are cache-first:
@@ -30,6 +31,7 @@ const APP_SHELL = [
   './index.html',
   './offline.html',
   './manifest.webmanifest',
+  './launch.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-512-maskable.png',
@@ -125,11 +127,18 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Everything else (hashed wasm/js, snippets, favicon, icons, manifest): cache first,
-  // searching every kept cache. Hashed names never change content, so a hit is always fresh.
+  // Everything else (hashed wasm/js, snippets, favicon, icons, manifest, launch.js): cache
+  // first — but ALWAYS from this build's cache first. Stable-name shell files (launch.js,
+  // manifest.webmanifest) change content between builds, so the retained previous cache must
+  // not shadow them. The cross-cache fallback preserves the rollback rationale: a stale
+  // index.html served during deploy propagation still resolves its old hashed assets from the
+  // previous build's cache. Hashed names never change content, so any hit there is fresh.
   event.respondWith(
     (async () => {
-      const cached = await caches.match(event.request, { ignoreVary: true });
+      const current = await caches.open(CACHE);
+      const cached =
+        (await current.match(event.request, { ignoreVary: true })) ||
+        (await caches.match(event.request, { ignoreVary: true }));
       if (cached) return cached;
       try {
         const fresh = await fetch(event.request);

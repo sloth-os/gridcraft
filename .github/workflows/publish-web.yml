@@ -30,7 +30,22 @@ env:
   RUSTFLAGS: "--cfg bindgen_0_71_plus"
 
 jobs:
+  test:
+    # The local PWA regression suite (tests/run-local.sh): runs THIS workflow's real assemble
+    # and verify scripts against a fake trunk output, plus the sw.js and launch.js mock
+    # tests. Gates the build so a broken shell can never reach Pages.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gridcraft-web
+        uses: actions/checkout@v4
+
+      - name: Run the local PWA regression suite
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet pyyaml
+          bash tests/run-local.sh
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout gridcraft-web (this repo — PWA shell and workflow)
@@ -148,9 +163,10 @@ jobs:
             | sort | sed "s|^\./|'./|; s|$|',|" | tr -d '\n')"
           echo "extra precache files: ${extras:-<none>}"
 
-          # 5. PWA: manifest + icons + service worker template.
+          # 5. PWA: manifest + icons + launch.js (file-handling consumer) + service worker.
           cp pwa/manifest.webmanifest publish/
           cp pwa/icons/*.png publish/icons/
+          cp pwa/launch.js publish/
           cp pwa/sw.js publish/
 
           # 6. Fill in the manifest placeholder (the version in its description).
@@ -180,6 +196,9 @@ jobs:
           html = html.replace(
               "<body>",
               "<body>\n"
+              '  <!-- PWA file handling: the launchQueue consumer for OS file launches.\n'
+              '       Loaded first so it registers before the wasm boot; precached in sw.js. -->\n'
+              '  <script src="launch.js"></script>\n'
               '  <script>\n'
               "    // PWA: register the service worker for offline use.\n"
               "    // sw.js precaches the app shell, the hashed wasm/js bundle, eframe's\n"
@@ -192,7 +211,7 @@ jobs:
               "  </script>",
           )
           path.write_text(html)
-          print("index.html: manifest link + service worker registration injected")
+          print("index.html: manifest link + launch.js + service worker registration injected")
           PY
           cp pwa/offline.html publish/
 
@@ -224,6 +243,33 @@ jobs:
           ls -la publish/
         # Step-level outputs feed the job outputs used by the verify/record jobs.
         id: assemble
+
+      - name: Check file_handlers parity with the upstream .desktop entry
+        # Warning only — upstream adding or dropping a spreadsheet MIME type must not block
+        # the weekly publish, but the drift should be visible so pwa/manifest.webmanifest can
+        # be updated deliberately.
+        run: |
+          set -euo pipefail
+          desks="$(find gridcraft/packaging -name '*.desktop' 2>/dev/null || true)"
+          if [[ -z "$desks" ]]; then
+            echo "::warning::no .desktop file found upstream — cannot check file_handlers MIME parity"
+            exit 0
+          fi
+          desk_mimes="$(find gridcraft/packaging -name '*.desktop' -exec sed -n 's/^MimeType=//p' {} + | tr ';' '\n' | sed '/^$/d' | sort -u)"
+          manifest_mimes="$(python3 -c "import json; [print(t) for t in sorted(json.load(open('publish/manifest.webmanifest'))['file_handlers'][0]['accept'])]")"
+          if [[ "$desk_mimes" == "$manifest_mimes" ]]; then
+            echo "file_handlers matches the upstream .desktop MIME set:"
+            echo "$desk_mimes" | sed 's/^/  /'
+          else
+            echo "::warning::manifest file_handlers MIME set differs from the upstream .desktop — consider updating pwa/manifest.webmanifest"
+            {
+              echo "### file_handlers drift vs upstream .desktop"
+              echo
+              echo '```diff'
+              diff <(echo "$desk_mimes") <(echo "$manifest_mimes") || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Configure Pages
         id: pages
@@ -293,6 +339,12 @@ jobs:
           grep -q 'rel="manifest"' live-index.html
           grep -q 'serviceWorker.register' live-index.html
           grep -q 'name="description"' live-index.html
+          grep -qF '<script src="launch.js"></script>' live-index.html
+          # launch.js's boot gate polls two upstream DOM ids (web.rs CANVAS_ID/LOADING_ID).
+          # If upstream renames either, file launches fail closed with a deadline error —
+          # fail the deploy loudly here instead (same policy as the assemble-step markers).
+          grep -q 'id="gridcraft_canvas"' live-index.html
+          grep -q 'id="gridcraft_loading"' live-index.html
 
           echo "== sw.js: stamped, SRI is base64, assets named =="
           grep -qF "const VERSION = 'gridcraft-${EXPECTED_STAMP}" live-sw.js
@@ -300,15 +352,51 @@ jobs:
           ! grep -qE "sha256-[0-9a-f]{64}" live-sw.js
           grep -qF "./${JS_NAME}" live-sw.js
           grep -qF "./${WASM_NAME}" live-sw.js
+          grep -qF "'./launch.js'" live-sw.js
 
-          echo "== manifest: valid JSON, filled in =="
-          python3 -m json.tool live-manifest.json > /dev/null
-          grep -q '"id"' live-manifest.json
-          grep -q 'icons/icon-192.png' live-manifest.json
-          grep -qF "${EXPECTED_STAMP%%+*}" live-manifest.json
+          echo "== launch.js: the File Handling consumer itself =="
+          # A HEAD 200 alone would pass a truncated or empty file: fetch it and check the
+          # parts that matter (the consumer registration, the drop bridge) plus the syntax.
+          fetch "${BASE}launch.js?cb=${CB}" -o live-launch.js
+          grep -qF 'launchQueue.setConsumer' live-launch.js
+          grep -qF "DragEvent('drop'" live-launch.js
+          node --check live-launch.js
+
+          echo "== manifest: valid JSON, filled in, file handling registered =="
+          VERSION="${EXPECTED_STAMP%%+*}" python3 - <<'PY'
+          import json
+          import os
+
+          m = json.load(open("live-manifest.json"))
+          assert m.get("id") == "./", m.get("id")
+          assert any(i.get("src") == "icons/icon-192.png" for i in m.get("icons", [])), "icon-192"
+          version = os.environ["VERSION"]
+          assert version and version in m.get("description", ""), m.get("description")
+          assert "@GRIDCRAFT_VERSION@" not in json.dumps(m), "manifest placeholder survived"
+          # launch_handler: focus an already-open window instead of yanking a live session.
+          modes = m.get("launch_handler", {}).get("client_mode")
+          modes = modes if isinstance(modes, list) else [modes]
+          assert modes and modes[0] == "focus-existing", modes
+          # file_handlers: upstream's .desktop MIME set → extensions, one client for all files.
+          fh = m.get("file_handlers")
+          assert isinstance(fh, list) and len(fh) == 1, fh
+          h = fh[0]
+          assert h.get("action") == "./", h
+          assert h.get("launch_type", "single-client") == "single-client", h
+          expected_accept = {
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+              "application/vnd.ms-excel.sheet.macroEnabled.12": [".xlsm"],
+              "application/vnd.ms-excel.sheet.binary.macroEnabled.12": [".xlsb"],
+              "application/vnd.oasis.opendocument.spreadsheet": [".ods"],
+              "text/csv": [".csv"],
+              "text/tab-separated-values": [".tsv"],
+          }
+          assert h.get("accept") == expected_accept, h.get("accept")
+          print("manifest: id, icons, version, launch_handler, file_handlers OK")
+          PY
 
           echo "== no placeholder survived anywhere =="
-          ! grep -lE '@[A-Z_]+@' live-index.html live-sw.js live-manifest.json
+          ! grep -lE '@[A-Z_]+@' live-index.html live-sw.js live-manifest.json live-launch.js
 
           echo "== every file the service worker precaches actually serves =="
           grep -oE "'\./[^']+'" live-sw.js | tr -d "'" | sed 's|^\./||' | sort -u | while read -r p; do
